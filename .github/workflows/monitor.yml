@@ -1,0 +1,73 @@
+name: Power monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub может запускать с задержкой 5–15+ мин
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Отправить тестовое сообщение в Telegram"
+        type: boolean
+        default: true
+
+concurrency:
+  group: power-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # только для keepalive-коммита раз в ~50 дней
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -q -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: power-state-${{ github.run_id }}
+          restore-keys: power-state-
+
+      - name: Check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          XIAOMI_USERNAME: ${{ secrets.XIAOMI_USERNAME }}
+          XIAOMI_PASSWORD: ${{ secrets.XIAOMI_PASSWORD }}
+          XIAOMI_USER_ID: ${{ secrets.XIAOMI_USER_ID }}
+          XIAOMI_SSECURITY: ${{ secrets.XIAOMI_SSECURITY }}
+          XIAOMI_SERVICE_TOKEN: ${{ secrets.XIAOMI_SERVICE_TOKEN }}
+          XIAOMI_REGION: ${{ secrets.XIAOMI_REGION }}
+          XIAOMI_DEVICE_ID: ${{ secrets.XIAOMI_DEVICE_ID }}
+          OFFLINE_THRESHOLD_MIN: ${{ vars.OFFLINE_THRESHOLD_MIN }}
+          TIMEZONE: ${{ vars.TIMEZONE }}
+        run: python monitor.py check ${{ inputs.test && '--test' || '' }}
+
+      - name: Save state
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: power-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # GitHub отключает cron в публичных репо после 60 дней без коммитов
+      - name: Keepalive
+        if: github.event_name == 'schedule'
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi

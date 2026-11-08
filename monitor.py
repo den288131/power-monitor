@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Мониторинг света через онлайн-статус робота-пылесоса в Xiaomi Cloud.
+
+Команды:
+  python monitor.py login         — ЛОКАЛЬНО: вход в Xiaomi, вывод токенов, региона и списка устройств
+  python monitor.py check         — проверка статуса + уведомления (запускается в GitHub Actions)
+  python monitor.py check --test  — то же + тестовое сообщение в Telegram с текущим статусом
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import hashlib
+import json
+import os
+import random
+import string
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+REGIONS = ["de", "ru", "cn", "us", "sg", "in", "tw", "i2"]
+STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
+HTTP_TIMEOUT = 20
+ERROR_ALERT_RUNS = 3          # сколько подряд неудачных проверок до предупреждения в Telegram
+PASSWORD_RETRY_MIN = 60       # не чаще раза в час пробовать вход по паролю, если он уже не удался
+
+
+def env(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default).strip()
+
+
+# ───────────────────────── Xiaomi Cloud ─────────────────────────
+
+class AuthError(Exception):
+    pass
+
+
+class TwoFactorRequired(AuthError):
+    def __init__(self, url: str):
+        super().__init__("Xiaomi требует подтвердить вход (2FA)")
+        self.url = url
+
+
+def rc4(key: bytes, data: bytes, drop: int = 0) -> bytes:
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    i = j = 0
+    out = bytearray()
+    for n in range(drop + len(data)):
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        if n >= drop:
+            out.append(data[n - drop] ^ s[(s[i] + s[j]) & 0xFF])
+    return bytes(out)
+
+
+def _parse_account_json(text: str) -> dict:
+    return json.loads(text.replace("&&&START&&&", "", 1))
+
+
+class XiaomiCloud:
+    """Неофициальный клиент Xiaomi Cloud (протокол как у Xiaomi-cloud-tokens-extractor)."""
+
+    def __init__(self, user_id: str = "", ssecurity: str = "", service_token: str = ""):
+        self.user_id, self.ssecurity, self.service_token = user_id, ssecurity, service_token
+        self.http = requests.Session()
+        rnd = "".join(random.choices(string.ascii_uppercase, k=13))
+        self.http.headers["User-Agent"] = f"Android-7.1.1-1.0.0-ONEPLUS A3010-136-{rnd} APP/xiaomi.smarthome APPV/62830"
+        self.device_id = "".join(random.choices(string.ascii_lowercase, k=6))
+
+    @property
+    def has_session(self) -> bool:
+        return bool(self.user_id and self.ssecurity and self.service_token)
+
+    # --- вход ---
+    def login(self, username: str, password: str) -> None:
+        h = {"Content-Type": "application/x-www-form-urlencoded"}
+        self.http.cookies.update({"sdkVersion": "accountsdk-18.8.15", "deviceId": self.device_id})
+
+        r = self.http.get("https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true",
+                          headers=h, cookies={"userId": username}, timeout=HTTP_TIMEOUT)
+        sign = _parse_account_json(r.text).get("_sign")
+        if not sign:
+            raise AuthError("шаг 1 входа: не получен _sign")
+
+        r = self.http.post("https://account.xiaomi.com/pass/serviceLoginAuth2", headers=h, timeout=HTTP_TIMEOUT, params={
+            "sid": "xiaomiio",
+            "hash": hashlib.md5(password.encode()).hexdigest().upper(),
+            "callback": "https://sts.api.io.mi.com/sts",
+            "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
+            "user": username,
+            "_sign": sign,
+            "_json": "true",
+        })
+        d = _parse_account_json(r.text)
+        if d.get("notificationUrl"):
+            url = d["notificationUrl"]
+            raise TwoFactorRequired(url if url.startswith("http") else "https://account.xiaomi.com" + url)
+        if d.get("captchaUrl"):
+            raise AuthError("Xiaomi требует капчу при входе")
+        if len(str(d.get("ssecurity") or "")) <= 4:
+            raise AuthError(f"вход не удался: {d.get('desc') or d.get('description') or d.get('code')}")
+        self.user_id, self.ssecurity = str(d["userId"]), d["ssecurity"]
+
+        r = self.http.get(d["location"], headers=h, timeout=HTTP_TIMEOUT)
+        token = r.cookies.get("serviceToken")
+        if not token:
+            raise AuthError("шаг 3 входа: не получен serviceToken")
+        self.service_token = token
+
+    # --- подписанные/шифрованные запросы к API ---
+    def _signed_nonce(self, nonce: str) -> str:
+        return base64.b64encode(hashlib.sha256(base64.b64decode(self.ssecurity) + base64.b64decode(nonce)).digest()).decode()
+
+    @staticmethod
+    def _signature(path: str, signed_nonce: str, params: dict) -> str:
+        parts = ["POST", path] + [f"{k}={v}" for k, v in params.items()] + [signed_nonce]
+        return base64.b64encode(hashlib.sha1("&".join(parts).encode()).digest()).decode()
+
+    def _api(self, region: str, path: str, params: dict) -> dict:
+        host = "api.io.mi.com" if region == "cn" else f"{region}.api.io.mi.com"
+        nonce = base64.b64encode(os.urandom(8) + int(time.time() / 60).to_bytes(4, "big")).decode()
+        signed = self._signed_nonce(nonce)
+        key = base64.b64decode(signed)
+
+        fields = dict(params)
+        fields["rc4_hash__"] = self._signature(path, signed, fields)
+        fields = {k: base64.b64encode(rc4(key, str(v).encode(), 1024)).decode() for k, v in fields.items()}
+        fields["signature"] = self._signature(path, signed, fields)
+        fields["ssecurity"] = self.ssecurity
+        fields["_nonce"] = nonce
+
+        r = self.http.post(f"https://{host}/app{path}", params=fields, timeout=HTTP_TIMEOUT, headers={
+            "Accept-Encoding": "identity",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2",
+            "MIOT-ENCRYPT-ALGORITHM": "ENCRYPT-RC4",
+        }, cookies={
+            "userId": self.user_id, "serviceToken": self.service_token, "yetAnotherServiceToken": self.service_token,
+            "locale": "en_GB", "timezone": "GMT+02:00", "is_daylight": "1", "dst_offset": "3600000",
+            "channel": "MI_APP_STORE",
+        })
+        if r.status_code in (401, 403):
+            raise AuthError(f"сессия Xiaomi недействительна (HTTP {r.status_code})")
+        r.raise_for_status()
+        try:
+            data = json.loads(rc4(key, base64.b64decode(r.text), 1024))
+        except Exception:
+            text = r.text[:200]
+            if "auth" in text.lower():
+                raise AuthError(f"сессия Xiaomi недействительна: {text}")
+            raise RuntimeError(f"не удалось расшифровать ответ Xiaomi: {text}")
+        if data.get("code") not in (0, None):
+            msg = f"Xiaomi API: code={data.get('code')} {data.get('message', '')}"
+            raise AuthError(msg) if "auth" in msg.lower() else RuntimeError(msg)
+        return data
+
+    def devices(self, region: str) -> list[dict]:
+        data = self._api(region, "/home/device_list", {
+            "data": '{"getVirtualModel":true,"getHuamiDevices":1,"get_split_device":false,"support_smart_home":true}'
+        })
+        return (data.get("result") or {}).get("list") or []
+
+
+def find_device(devices: list[dict], device_id: str) -> dict:
+    if device_id:
+        for d in devices:
+            if str(d.get("did")) == device_id:
+                return d
+        raise RuntimeError(f"устройство {device_id} не найдено в аккаунте (проверь XIAOMI_DEVICE_ID и XIAOMI_REGION)")
+    vacuums = [d for d in devices if "vacuum" in str(d.get("model", "")).lower()]
+    if len(vacuums) == 1:
+        return vacuums[0]
+    names = ", ".join(f"{d.get('name')} [{d.get('did')}]" for d in devices) or "нет устройств"
+    raise RuntimeError(f"не удалось однозначно выбрать пылесос, задай XIAOMI_DEVICE_ID. Устройства: {names}")
+
+
+# ───────────────────────── Telegram ─────────────────────────
+
+def tg_send(text: str) -> None:
+    token, chat = env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        print(f"[telegram не настроен] {text}")
+        return
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
+                          timeout=HTTP_TIMEOUT)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Telegram недоступен: {type(e).__name__}") from None  # без URL — в нём токен
+    if not r.ok:
+        raise RuntimeError(f"Telegram: HTTP {r.status_code} {r.text[:200]}")
+    print(f"[telegram] {text}")
+
+
+# ───────────────────────── Логика состояний ─────────────────────────
+
+def step(state: dict, online: bool, now: float, threshold_s: float) -> tuple[dict, list[tuple]]:
+    """Чистая функция: новое состояние + события ('lost', since) / ('restored', since_off, duration)."""
+    st = dict(state)
+    events: list[tuple] = []
+    status = st.get("status")
+    if online:
+        st["offline_candidate"] = None
+        if status == "offline":
+            events.append(("restored", st["since"], now - st["since"]))
+            st.update(status="online", since=now)
+        elif status is None:
+            st.update(status="online", since=now)
+    elif status != "offline":
+        cand = st.get("offline_candidate") or now
+        st["offline_candidate"] = cand
+        if now - cand >= threshold_s:
+            events.append(("lost", cand))
+            st.update(status="offline", since=cand, offline_candidate=None)
+    return st, events
+
+
+def _tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(env("TIMEZONE", "Europe/Kyiv"))
+    except Exception:
+        return timezone.utc
+
+
+def fmt_time(ts: float) -> str:
+    dt = datetime.fromtimestamp(ts, _tz())
+    today = datetime.now(_tz()).date()
+    return dt.strftime("%H:%M") if dt.date() == today else dt.strftime("%d.%m %H:%M")
+
+
+def fmt_dur(sec: float) -> str:
+    m = int(sec // 60)
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин" if h else f"{m} мин"
+
+
+def event_text(ev: tuple, now: float) -> str:
+    if ev[0] == "lost":
+        return f"❌ Света нет\nРобот офлайн примерно с {fmt_time(ev[1])} (уже {fmt_dur(now - ev[1])})."
+    return f"✅ Свет есть\nРобот снова онлайн. Не было примерно {fmt_dur(ev[2])} (с {fmt_time(ev[1])})."
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
+
+
+# ───────────────────────── Команды ─────────────────────────
+
+def fetch_device(state: dict, now: float) -> dict:
+    region = env("XIAOMI_REGION", "de").lower()
+    device_id = env("XIAOMI_DEVICE_ID")
+    user, pw = env("XIAOMI_USERNAME"), env("XIAOMI_PASSWORD")
+    cloud = XiaomiCloud(env("XIAOMI_USER_ID"), env("XIAOMI_SSECURITY"), env("XIAOMI_SERVICE_TOKEN"))
+
+    if cloud.has_session:
+        try:
+            return find_device(cloud.devices(region), device_id)
+        except AuthError as e:
+            print(f"Токены не подошли: {e}")
+            if not (user and pw):
+                raise
+    if not (user and pw):
+        raise AuthError("не заданы ни токены (XIAOMI_SERVICE_TOKEN и др.), ни логин/пароль")
+
+    last = state.get("last_password_login", 0)
+    if (state.get("problem") or {}).get("kind") == "auth" and now - last < PASSWORD_RETRY_MIN * 60:
+        raise AuthError("вход по паролю недавно не удался, следующая попытка позже")
+    state["last_password_login"] = now
+    try:
+        cloud.login(user, pw)
+    except TwoFactorRequired:
+        raise AuthError("Xiaomi требует подтвердить вход с сервера GitHub. "
+                        "Запусти локально `python monitor.py login` и обнови секреты с токенами") from None
+    print("Вход по паролю успешен (для стабильности лучше прописать свежие токены в секреты)")
+    return find_device(cloud.devices(region), device_id)
+
+
+def report_problem(state: dict, kind: str, text: str) -> None:
+    p = state.get("problem") or {"count": 0, "alerted": False, "since": time.time()}
+    p["count"] += 1
+    p["kind"] = kind
+    need = 1 if kind == "auth" else ERROR_ALERT_RUNS
+    if not p["alerted"] and p["count"] >= need:
+        try:
+            tg_send(f"⚠️ Мониторинг света не может проверить статус\n{text}\n"
+                    "Пока это не исправлено, уведомления о свете не приходят.")
+            p["alerted"] = True
+        except Exception as e:
+            print(f"Не удалось отправить предупреждение: {e}")
+    state["problem"] = p
+
+
+def cmd_check(test: bool) -> int:
+    now = time.time()
+    threshold = float(env("OFFLINE_THRESHOLD_MIN", "10")) * 60
+    state = load_state()
+
+    try:
+        dev = fetch_device(state, now)
+    except AuthError as e:
+        print(f"Ошибка авторизации: {e}")
+        report_problem(state, "auth", f"Ошибка входа в Xiaomi: {e}")
+        save_state(state)
+        if test:
+            tg_send(f"🔧 Тест: ошибка входа в Xiaomi — {e}")
+        return 1 if test else 0
+    except Exception as e:
+        print(f"Ошибка проверки: {type(e).__name__}: {e}")
+        report_problem(state, "error", f"{type(e).__name__}: {e}")
+        save_state(state)
+        if test:
+            tg_send(f"🔧 Тест: ошибка проверки — {type(e).__name__}: {e}")
+        return 1 if test else 0
+
+    online = bool(dev.get("isOnline"))
+    print(f"{dev.get('name')} [{dev.get('did')}, {dev.get('model')}]: {'online' if online else 'OFFLINE'}")
+
+    if (state.get("problem") or {}).get("alerted"):
+        try:
+            tg_send("✅ Мониторинг света снова работает.")
+        except Exception as e:
+            print(f"Не удалось отправить сообщение: {e}")
+    state.pop("problem", None)
+
+    new_state, events = step(state, online, now, threshold)
+    try:
+        for ev in events:
+            tg_send(event_text(ev, now))
+        state = new_state  # продвигаем состояние только если уведомления ушли
+    except Exception as e:
+        print(f"Не удалось отправить уведомление, повторим в следующий запуск: {e}")
+    state["last_check"] = now
+    save_state(state)
+
+    if test:
+        cand = state.get("offline_candidate")
+        extra = f"\nОфлайн с {fmt_time(cand)}, ждём порог {int(threshold // 60)} мин." if cand and state.get("status") != "offline" else ""
+        tg_send(f"🔧 Тест мониторинга\n«{dev.get('name')}»: {'онлайн — свет есть' if online else 'офлайн'}{extra}")
+    return 0
+
+
+def cmd_login() -> int:
+    user = env("XIAOMI_USERNAME") or input("Логин Xiaomi (email / телефон / ID): ").strip()
+    pw = env("XIAOMI_PASSWORD") or getpass.getpass("Пароль Xiaomi: ")
+    cloud = XiaomiCloud()
+    for attempt in range(3):
+        try:
+            cloud.login(user, pw)
+            break
+        except TwoFactorRequired as e:
+            print("\nXiaomi просит подтвердить вход. Открой ссылку в браузере, подтверди (код из SMS/почты),")
+            print("затем вернись сюда и нажми Enter:\n")
+            print(e.url, "\n")
+            input("Enter, когда подтвердишь… ")
+    else:
+        print("Не удалось войти после подтверждения. Попробуй ещё раз позже.")
+        return 1
+
+    print("\nВход выполнен. Ищу устройства по регионам…")
+    found_region = ""
+    for region in REGIONS:
+        try:
+            devs = cloud.devices(region)
+        except Exception as e:
+            print(f"  {region}: ошибка ({e})")
+            continue
+        if not devs:
+            continue
+        found_region = found_region or region
+        print(f"\n  Регион {region}:")
+        for d in devs:
+            print(f"    did={d.get('did'):<14} {'online ' if d.get('isOnline') else 'OFFLINE'}  {d.get('model'):<28} {d.get('name')}")
+
+    print("\n──────── Добавь в GitHub → Settings → Secrets and variables → Actions → Secrets ────────")
+    print(f"XIAOMI_USER_ID        = {cloud.user_id}")
+    print(f"XIAOMI_SSECURITY      = {cloud.ssecurity}")
+    print(f"XIAOMI_SERVICE_TOKEN  = {cloud.service_token}")
+    print(f"XIAOMI_REGION         = {found_region or '(устройства не найдены)'}")
+    print("XIAOMI_DEVICE_ID      = did пылесоса из списка выше")
+    print("──────────────────────────────────────────────────────────────────────────────────────")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("login", help="локальный вход: токены, регион, список устройств")
+    c = sub.add_parser("check", help="проверка статуса и уведомления")
+    c.add_argument("--test", action="store_true", help="отправить тестовое сообщение с текущим статусом")
+    a = p.parse_args()
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8")
+    return cmd_login() if a.cmd == "login" else cmd_check(a.test)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
