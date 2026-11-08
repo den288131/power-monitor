@@ -10,7 +10,7 @@ on:
       test:
         description: "Только тест: прислать текущий статус в Telegram (без цикла)"
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: power-monitor-${{ inputs.test && 'test' || 'loop' }}
