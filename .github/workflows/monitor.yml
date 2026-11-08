@@ -54,6 +54,7 @@ jobs:
           OFFLINE_THRESHOLD_MIN: ${{ vars.OFFLINE_THRESHOLD_MIN }}
           TIMEZONE: ${{ vars.TIMEZONE }}
           SUMMARY_HOUR: ${{ vars.SUMMARY_HOUR }}
+          SUMMARY_WEEKDAY: ${{ vars.SUMMARY_WEEKDAY }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           PYTHONUNBUFFERED: "1"
         run: python monitor.py check ${{ inputs.test && '--test' || '--loop-minutes 345 --interval 60' }}
