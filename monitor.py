@@ -21,7 +21,7 @@ import string
 import tempfile
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -322,7 +322,7 @@ def step(state: dict, online: bool, now: float, threshold_s: float) -> tuple[dic
 def _tz():
     try:
         from zoneinfo import ZoneInfo
-        return ZoneInfo(env("TIMEZONE", "Europe/Kyiv"))
+        return ZoneInfo(env("TIMEZONE", "Europe/Moscow"))
     except Exception:
         return timezone.utc
 
@@ -354,6 +354,112 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
+
+
+# ───────────────────────── История и сводки ─────────────────────────
+
+HISTORY_DAYS = 40
+WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def record_events(state: dict, events: list[tuple], now: float) -> None:
+    """Пишет отключения в state['history'] как [{'start', 'end'|None}]."""
+    hist = state.setdefault("history", [])
+    for ev in events:
+        if ev[0] == "lost":
+            hist.append({"start": ev[1], "end": None})
+        else:
+            open_ = [h for h in hist if h["end"] is None]
+            if open_:
+                open_[-1]["end"] = now
+            else:
+                hist.append({"start": ev[1], "end": now})
+    cutoff = now - HISTORY_DAYS * 86400
+    state["history"] = [h for h in hist if (h["end"] or now) >= cutoff]
+
+
+def _day_start(d) -> float:
+    return datetime(d.year, d.month, d.day, tzinfo=_tz()).timestamp()
+
+
+def outages_in(hist: list[dict], start: float, end: float, now: float) -> list[tuple[float, float, bool]]:
+    """Отключения, пересекающие [start, end), обрезанные по границам: (from, to, продолжается)."""
+    out = []
+    for h in sorted(hist, key=lambda h: h["start"]):
+        s, e = h["start"], h["end"] if h["end"] is not None else min(now, end)
+        if s < end and e > start:
+            out.append((max(s, start), min(e, end), h["end"] is None and e >= now))
+    return out
+
+
+def _clock(ts: float) -> str:
+    return datetime.fromtimestamp(ts, _tz()).strftime("%H:%M")
+
+
+def _since_note(since: float | None, start: float) -> str:
+    if since and since > start:
+        return f"\nℹ️ Учёт ведётся с {datetime.fromtimestamp(since, _tz()):%d.%m %H:%M}, раньше данных нет."
+    return ""
+
+
+def day_summary(hist: list[dict], day, now: float, since: float | None = None) -> str:
+    start = _day_start(day)
+    end = _day_start(day + timedelta(days=1))
+    items = outages_in(hist, start, end, now)
+    title = f"📊 Сводка за {WEEKDAYS[day.weekday()]} {day:%d.%m}"
+    note = _since_note(since, start)
+    if not items:
+        return f"{title}\nОтключений не было ✅{note}"
+    total = sum(b - a for a, b, _ in items)
+    lines = [title, f"Отключений: {len(items)}, без света {fmt_dur(total)} ({total / (end - start):.0%} суток)"]
+    for a, b, ongoing in items:
+        tail = "…сейчас" if ongoing else _clock(b) if b < end else "24:00"
+        lines.append(f"• {_clock(a)}–{tail} ({fmt_dur(b - a)})")
+    return "\n".join(lines) + note
+
+
+def week_summary(hist: list[dict], monday, now: float, since: float | None = None) -> str:
+    start = _day_start(monday)
+    end = _day_start(monday + timedelta(days=7))
+    items = outages_in(hist, start, end, now)
+    total = sum(b - a for a, b, _ in items)
+    title = f"📅 Сводка за неделю {monday:%d.%m}–{monday + timedelta(days=6):%d.%m}"
+    note = _since_note(since, start)
+    if not items:
+        return f"{title}\nОтключений не было ✅{note}"
+    lines = [title, f"Отключений: {len(items)}, без света {fmt_dur(total)} ({total / (end - start):.0%} времени)"]
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        di = outages_in(hist, _day_start(d), _day_start(d + timedelta(days=1)), now)
+        dur = sum(b - a for a, b, _ in di)
+        lines.append(f"{WEEKDAYS[i]} {d:%d.%m}: " + (f"{fmt_dur(dur)} ({len(di)} шт.)" if di else "—"))
+    return "\n".join(lines) + note
+
+
+def due_summaries(state: dict, now: float) -> list[tuple[str, str, str]]:
+    """Какие сводки пора отправить: [(ключ в state, значение, текст)]. Сводки шлются в SUMMARY_HOUR за прошедший день/неделю."""
+    local = datetime.fromtimestamp(now, _tz())
+    if local.hour < int(env("SUMMARY_HOUR", "8")) or "status" not in state:
+        return []
+    hist, since = state.get("history", []), state.get("history_since")
+    yesterday = local.date() - timedelta(days=1)
+    out = []
+    if state.get("last_daily") != yesterday.isoformat():
+        out.append(("last_daily", yesterday.isoformat(), day_summary(hist, yesterday, now, since)))
+    if local.weekday() == 0:
+        monday = local.date() - timedelta(days=7)
+        if state.get("last_weekly") != monday.isoformat():
+            out.append(("last_weekly", monday.isoformat(), week_summary(hist, monday, now, since)))
+    return out
+
+
+def send_summaries(state: dict, now: float) -> None:
+    for key, value, text in due_summaries(state, now):
+        try:
+            tg_send(text)
+            state[key] = value
+        except Exception as e:
+            print(f"Не удалось отправить сводку: {e}")
 
 
 # ───────────────────────── Команды ─────────────────────────
@@ -434,6 +540,7 @@ def check_once(state: dict, threshold: float) -> dict:
         except Exception as e:
             print(f"Не удалось отправить сообщение: {e}")
     state.pop("problem", None)
+    state.setdefault("history_since", now)
 
     new_state, events = step(state, online, now, threshold)
     try:
@@ -441,6 +548,7 @@ def check_once(state: dict, threshold: float) -> dict:
             tg_send(event_text(ev, now))
         state.clear()
         state.update(new_state)  # продвигаем состояние только если уведомления ушли
+        record_events(state, events, now)
     except Exception as e:
         print(f"Не удалось отправить уведомление, повторим при следующей проверке: {e}")
     state["last_check"] = now
@@ -471,12 +579,14 @@ def cmd_check(test: bool, loop_minutes: float, interval: float) -> int:
         online = bool(dev.get("isOnline"))
         tg_send(f"🔧 Тест мониторинга\n«{dev.get('name')}»: {'онлайн — свет есть' if online else 'офлайн'}\n"
                 f"Сохранённый статус: {state.get('status') or 'нет'}, порог {int(threshold // 60)} мин.")
+        tg_send(day_summary(state.get("history", []), datetime.now(_tz()).date(), time.time(), state.get("history_since")).replace("Сводка за", "Сводка (пока) за", 1))
         return 0
 
     deadline = time.time() + loop_minutes * 60
     while True:
         started = time.time()
         check_once(state, threshold)
+        send_summaries(state, time.time())
         save_state(state)
         heartbeat()
         if started + interval > deadline:
