@@ -378,8 +378,9 @@ def record_events(state: dict, events: list[tuple], now: float) -> None:
     state["history"] = [h for h in hist if (h["end"] or now) >= cutoff]
 
 
-def _day_start(d) -> float:
-    return datetime(d.year, d.month, d.day, tzinfo=_tz()).timestamp()
+def _boundary(d) -> float:
+    """Граница суток для сводок: d в SUMMARY_HOUR:00 (по умолчанию 21:00)."""
+    return datetime(d.year, d.month, d.day, int(env("SUMMARY_HOUR", "21")), tzinfo=_tz()).timestamp()
 
 
 def outages_in(hist: list[dict], start: float, end: float, now: float) -> list[tuple[float, float, bool]]:
@@ -392,8 +393,12 @@ def outages_in(hist: list[dict], start: float, end: float, now: float) -> list[t
     return out
 
 
-def _clock(ts: float) -> str:
-    return datetime.fromtimestamp(ts, _tz()).strftime("%H:%M")
+def _point(ts: float, ref: float) -> str:
+    """HH:MM, а если день отличается от дня ref — «вс 22:10»."""
+    dt = datetime.fromtimestamp(ts, _tz())
+    if dt.date() == datetime.fromtimestamp(ref, _tz()).date():
+        return dt.strftime("%H:%M")
+    return f"{WEEKDAYS[dt.weekday()]} {dt:%H:%M}"
 
 
 def _since_note(since: float | None, start: float) -> str:
@@ -402,54 +407,59 @@ def _since_note(since: float | None, start: float) -> str:
     return ""
 
 
-def day_summary(hist: list[dict], day, now: float, since: float | None = None) -> str:
-    start = _day_start(day)
-    end = _day_start(day + timedelta(days=1))
+def period_summary(hist: list[dict], start: float, end: float, now: float, title: str, since: float | None = None) -> str:
     items = outages_in(hist, start, end, now)
-    title = f"📊 Сводка за {WEEKDAYS[day.weekday()]} {day:%d.%m}"
     note = _since_note(since, start)
     if not items:
         return f"{title}\nОтключений не было ✅{note}"
     total = sum(b - a for a, b, _ in items)
-    lines = [title, f"Отключений: {len(items)}, без света {fmt_dur(total)} ({total / (end - start):.0%} суток)"]
+    lines = [title, f"Отключений: {len(items)}, без света {fmt_dur(total)} ({total / (end - start):.0%} времени)"]
     for a, b, ongoing in items:
-        tail = "…сейчас" if ongoing else _clock(b) if b < end else "24:00"
-        lines.append(f"• {_clock(a)}–{tail} ({fmt_dur(b - a)})")
+        lines.append(f"• {_point(a, end)}–{'…сейчас' if ongoing else _point(b, end)} ({fmt_dur(b - a)})")
     return "\n".join(lines) + note
 
 
-def week_summary(hist: list[dict], monday, now: float, since: float | None = None) -> str:
-    start = _day_start(monday)
-    end = _day_start(monday + timedelta(days=7))
+def day_summary(hist: list[dict], day, now: float, since: float | None = None) -> str:
+    """Сутки, заканчивающиеся в SUMMARY_HOUR дня day."""
+    end = _boundary(day)
+    hh = datetime.fromtimestamp(end, _tz()).strftime("%H:%M")
+    title = f"📊 Сводка за сутки: {WEEKDAYS[day.weekday()]} {day:%d.%m} (с {hh} вчера до {hh})"
+    return period_summary(hist, end - 86400, end, now, title, since)
+
+
+def week_summary(hist: list[dict], last_day, now: float, since: float | None = None) -> str:
+    """7 суток, заканчивающихся в SUMMARY_HOUR дня last_day, с разбивкой по суткам."""
+    end = _boundary(last_day)
+    start = end - 7 * 86400
+    first = last_day - timedelta(days=6)
+    title = f"📅 Сводка за неделю {first:%d.%m}–{last_day:%d.%m}"
     items = outages_in(hist, start, end, now)
-    total = sum(b - a for a, b, _ in items)
-    title = f"📅 Сводка за неделю {monday:%d.%m}–{monday + timedelta(days=6):%d.%m}"
     note = _since_note(since, start)
     if not items:
         return f"{title}\nОтключений не было ✅{note}"
+    total = sum(b - a for a, b, _ in items)
     lines = [title, f"Отключений: {len(items)}, без света {fmt_dur(total)} ({total / (end - start):.0%} времени)"]
     for i in range(7):
-        d = monday + timedelta(days=i)
-        di = outages_in(hist, _day_start(d), _day_start(d + timedelta(days=1)), now)
+        d = first + timedelta(days=i)
+        di = outages_in(hist, _boundary(d) - 86400, _boundary(d), now)
         dur = sum(b - a for a, b, _ in di)
-        lines.append(f"{WEEKDAYS[i]} {d:%d.%m}: " + (f"{fmt_dur(dur)} ({len(di)} шт.)" if di else "—"))
+        lines.append(f"{WEEKDAYS[d.weekday()]} {d:%d.%m}: " + (f"{fmt_dur(dur)} ({len(di)} шт.)" if di else "—"))
     return "\n".join(lines) + note
 
 
 def due_summaries(state: dict, now: float) -> list[tuple[str, str, str]]:
-    """Какие сводки пора отправить: [(ключ в state, значение, текст)]. Сводки шлются в SUMMARY_HOUR за прошедший день/неделю."""
+    """Какие сводки пора отправить: [(ключ в state, значение, текст)].
+    Каждый день в SUMMARY_HOUR — за прошедшие сутки; в SUMMARY_WEEKDAY (0=пн … 6=вс) — ещё и за неделю."""
     local = datetime.fromtimestamp(now, _tz())
-    if local.hour < int(env("SUMMARY_HOUR", "8")) or "status" not in state:
+    if local.hour < int(env("SUMMARY_HOUR", "21")) or "status" not in state:
         return []
     hist, since = state.get("history", []), state.get("history_since")
-    yesterday = local.date() - timedelta(days=1)
+    today = local.date()
     out = []
-    if state.get("last_daily") != yesterday.isoformat():
-        out.append(("last_daily", yesterday.isoformat(), day_summary(hist, yesterday, now, since)))
-    if local.weekday() == 0:
-        monday = local.date() - timedelta(days=7)
-        if state.get("last_weekly") != monday.isoformat():
-            out.append(("last_weekly", monday.isoformat(), week_summary(hist, monday, now, since)))
+    if state.get("last_daily") != today.isoformat():
+        out.append(("last_daily", today.isoformat(), day_summary(hist, today, now, since)))
+    if local.weekday() == int(env("SUMMARY_WEEKDAY", "6")) and state.get("last_weekly") != today.isoformat():
+        out.append(("last_weekly", today.isoformat(), week_summary(hist, today, now, since)))
     return out
 
 
@@ -579,7 +589,9 @@ def cmd_check(test: bool, loop_minutes: float, interval: float) -> int:
         online = bool(dev.get("isOnline"))
         tg_send(f"🔧 Тест мониторинга\n«{dev.get('name')}»: {'онлайн — свет есть' if online else 'офлайн'}\n"
                 f"Сохранённый статус: {state.get('status') or 'нет'}, порог {int(threshold // 60)} мин.")
-        tg_send(day_summary(state.get("history", []), datetime.now(_tz()).date(), time.time(), state.get("history_since")).replace("Сводка за", "Сводка (пока) за", 1))
+        now = time.time()
+        tg_send(period_summary(state.get("history", []), now - 86400, now, now,
+                               "📊 Сводка за последние 24 ч", state.get("history_since")))
         return 0
 
     deadline = time.time() + loop_minutes * 60
