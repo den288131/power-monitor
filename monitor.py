@@ -447,6 +447,17 @@ def check_once(state: dict, threshold: float) -> dict:
     return dev
 
 
+def heartbeat() -> None:
+    """Отметка «мониторинг жив» для внешнего сторожа (healthchecks.io). Ошибки игнорируются."""
+    url = env("HEALTHCHECK_URL")
+    if not url:
+        return
+    try:
+        requests.get(url, timeout=10)
+    except requests.RequestException as e:
+        print(f"heartbeat не отправлен: {type(e).__name__}")
+
+
 def cmd_check(test: bool, loop_minutes: float, interval: float) -> int:
     threshold = float(env("OFFLINE_THRESHOLD_MIN", "5")) * 60
     state = load_state()
@@ -467,6 +478,7 @@ def cmd_check(test: bool, loop_minutes: float, interval: float) -> int:
         started = time.time()
         check_once(state, threshold)
         save_state(state)
+        heartbeat()
         if started + interval > deadline:
             return 0
         time.sleep(max(0.0, interval - (time.time() - started)))

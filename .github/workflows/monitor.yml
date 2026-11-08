@@ -53,6 +53,7 @@ jobs:
           XIAOMI_DEVICE_ID: ${{ secrets.XIAOMI_DEVICE_ID }}
           OFFLINE_THRESHOLD_MIN: ${{ vars.OFFLINE_THRESHOLD_MIN }}
           TIMEZONE: ${{ vars.TIMEZONE }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           PYTHONUNBUFFERED: "1"
         run: python monitor.py check ${{ inputs.test && '--test' || '--loop-minutes 345 --interval 60' }}
 
