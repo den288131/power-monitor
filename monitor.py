@@ -15,11 +15,14 @@ import hashlib
 import json
 import os
 import random
+import re
 import string
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -82,7 +85,8 @@ class XiaomiCloud:
         return bool(self.user_id and self.ssecurity and self.service_token)
 
     # --- вход ---
-    def login(self, username: str, password: str) -> None:
+    # ask_captcha(image_bytes) -> str и ask_email_code() -> str передаются только при локальном интерактивном входе.
+    def login(self, username: str, password: str, ask_captcha=None, ask_email_code=None) -> None:
         h = {"Content-Type": "application/x-www-form-urlencoded"}
         self.http.cookies.update({"sdkVersion": "accountsdk-18.8.15", "deviceId": self.device_id})
 
@@ -92,7 +96,8 @@ class XiaomiCloud:
         if not sign:
             raise AuthError("шаг 1 входа: не получен _sign")
 
-        r = self.http.post("https://account.xiaomi.com/pass/serviceLoginAuth2", headers=h, timeout=HTTP_TIMEOUT, params={
+        url = "https://account.xiaomi.com/pass/serviceLoginAuth2"
+        fields = {
             "sid": "xiaomiio",
             "hash": hashlib.md5(password.encode()).hexdigest().upper(),
             "callback": "https://sts.api.io.mi.com/sts",
@@ -100,22 +105,110 @@ class XiaomiCloud:
             "user": username,
             "_sign": sign,
             "_json": "true",
-        })
-        d = _parse_account_json(r.text)
-        if d.get("notificationUrl"):
-            url = d["notificationUrl"]
-            raise TwoFactorRequired(url if url.startswith("http") else "https://account.xiaomi.com" + url)
-        if d.get("captchaUrl"):
-            raise AuthError("Xiaomi требует капчу при входе")
-        if len(str(d.get("ssecurity") or "")) <= 4:
-            raise AuthError(f"вход не удался: {d.get('desc') or d.get('description') or d.get('code')}")
-        self.user_id, self.ssecurity = str(d["userId"]), d["ssecurity"]
+        }
+        d = _parse_account_json(self.http.post(url, headers=h, params=fields, allow_redirects=False,
+                                               timeout=HTTP_TIMEOUT).text)
+        for _ in range(3):
+            if not d.get("captchaUrl"):
+                break
+            if not ask_captcha:
+                raise AuthError("Xiaomi требует капчу при входе")
+            cu = d["captchaUrl"]
+            img = self.http.get(cu if cu.startswith("http") else "https://account.xiaomi.com" + cu, timeout=HTTP_TIMEOUT)
+            fields["captCode"] = ask_captcha(img.content)
+            d = _parse_account_json(self.http.post(url, headers=h, params=fields, allow_redirects=False,
+                                                   timeout=HTTP_TIMEOUT).text)
+            if d.get("code") == 87001:
+                print("Неверная капча, ещё раз.")
+                d["captchaUrl"] = d.get("captchaUrl") or cu
 
-        r = self.http.get(d["location"], headers=h, timeout=HTTP_TIMEOUT)
-        token = r.cookies.get("serviceToken")
-        if not token:
-            raise AuthError("шаг 3 входа: не получен serviceToken")
-        self.service_token = token
+        if len(str(d.get("ssecurity") or "")) > 4:
+            self.user_id, self.ssecurity = str(d["userId"]), d["ssecurity"]
+            r = self.http.get(d["location"], headers=h, timeout=HTTP_TIMEOUT)
+            token = r.cookies.get("serviceToken")
+            if not token:
+                raise AuthError("шаг 3 входа: не получен serviceToken")
+            self.service_token = token
+            return
+
+        if d.get("notificationUrl"):
+            nu = d["notificationUrl"]
+            nu = nu if nu.startswith("http") else "https://account.xiaomi.com" + nu
+            if not ask_email_code:
+                raise TwoFactorRequired(nu)
+            self._email_2fa(nu, ask_email_code)
+            return
+        code = d.get("code")
+        hint = " — неверный логин или пароль" if code == 70016 else ""
+        raise AuthError(f"code={code} {d.get('desc') or d.get('description') or ''}{hint}")
+
+    def _cookie(self, name: str) -> str:
+        for c in self.http.cookies:
+            if c.name == name and c.value:
+                return c.value
+        return ""
+
+    def _email_2fa(self, notification_url: str, ask_code) -> None:
+        """Подтверждение входа кодом из почты (порт do_2fa_email_flow из Xiaomi-cloud-tokens-extractor)."""
+        h = {"Content-Type": "application/x-www-form-urlencoded"}
+        acc = "https://account.xiaomi.com"
+        self.http.get(notification_url, headers=h, timeout=HTTP_TIMEOUT)
+        context = parse_qs(urlparse(notification_url).query)["context"][0]
+        base = {"sid": "xiaomiio", "context": context, "_locale": "en_US"}
+        self.http.get(f"{acc}/identity/list", params=base, headers=h, timeout=HTTP_TIMEOUT)
+        self.http.post(f"{acc}/identity/auth/sendEmailTicket", headers=h, timeout=HTTP_TIMEOUT,
+                       params={**base, "_dc": str(int(time.time() * 1000)), "mask": "0"},
+                       data={"retry": "0", "icode": "", "_json": "true", "ick": self._cookie("ick")})
+
+        code = ask_code()
+        r = self.http.post(f"{acc}/identity/auth/verifyEmail", headers=h, timeout=HTTP_TIMEOUT,
+                           params={**base, "_flag": "8", "_json": "true", "mask": "0"},
+                           data={"_flag": "8", "ticket": code, "trust": "false", "_json": "true", "ick": self._cookie("ick")})
+        if r.status_code != 200:
+            raise AuthError(f"код не принят: HTTP {r.status_code}")
+        try:
+            jr = _parse_account_json(r.text)
+            if jr.get("code") not in (0, None):
+                raise AuthError(f"код не принят: {jr.get('tips') or jr.get('desc') or jr.get('code')}")
+            finish = jr.get("location")
+        except json.JSONDecodeError:
+            finish = r.headers.get("Location")
+            m = not finish and re.search(r'https://account\.xiaomi\.com/identity/result/check\?[^"\']+', r.text)
+            finish = finish or (m.group(0) if m else None)
+        if not finish:
+            r0 = self.http.get(f"{acc}/identity/result/check", params=base, headers=h,
+                               allow_redirects=False, timeout=HTTP_TIMEOUT)
+            if r0.status_code in (301, 302):
+                finish = r0.headers.get("Location")
+        if not finish:
+            raise AuthError("после кода не найден адрес завершения входа")
+
+        end_url = finish
+        if "identity/result/check" in finish:
+            end_url = self.http.get(finish, headers=h, allow_redirects=False, timeout=HTTP_TIMEOUT).headers.get("Location")
+        if not end_url:
+            raise AuthError("не найден Auth2/end")
+        r = self.http.get(end_url, headers=h, allow_redirects=False, timeout=HTTP_TIMEOUT)
+        if r.status_code == 200 and "Xiaomi Account - Tips" in r.text:
+            r = self.http.get(end_url, headers=h, allow_redirects=False, timeout=HTTP_TIMEOUT)
+        try:
+            self.ssecurity = json.loads(r.headers.get("extension-pragma") or "{}").get("ssecurity") or ""
+        except json.JSONDecodeError:
+            pass
+        if not self.ssecurity:
+            raise AuthError("после кода не получен ssecurity")
+
+        sts = r.headers.get("Location")
+        if not sts and "https://sts.api.io.mi.com/sts" in r.text:
+            i = r.text.find("https://sts.api.io.mi.com/sts")
+            sts = r.text[i:r.text.find('"', i)]
+        if not sts:
+            raise AuthError("не найден STS-редирект")
+        self.http.get(sts, headers=h, timeout=HTTP_TIMEOUT)
+        self.service_token = self._cookie("serviceToken")
+        self.user_id = self.user_id or self._cookie("userId")
+        if not (self.service_token and self.user_id):
+            raise AuthError("после кода не получены serviceToken/userId")
 
     # --- подписанные/шифрованные запросы к API ---
     def _signed_nonce(self, nonce: str) -> str:
@@ -360,18 +453,27 @@ def cmd_check(test: bool) -> int:
 def cmd_login() -> int:
     user = env("XIAOMI_USERNAME") or input("Логин Xiaomi (email / телефон / ID): ").strip()
     pw = env("XIAOMI_PASSWORD") or getpass.getpass("Пароль Xiaomi: ")
-    cloud = XiaomiCloud()
-    for attempt in range(3):
+    def ask_captcha(img: bytes) -> str:
+        path = Path(tempfile.gettempdir()) / "xiaomi_captcha.jpg"
+        path.write_bytes(img)
+        print(f"\nXiaomi просит капчу. Картинка: {path}")
         try:
-            cloud.login(user, pw)
-            break
-        except TwoFactorRequired as e:
-            print("\nXiaomi просит подтвердить вход. Открой ссылку в браузере, подтверди (код из SMS/почты),")
-            print("затем вернись сюда и нажми Enter:\n")
-            print(e.url, "\n")
-            input("Enter, когда подтвердишь… ")
-    else:
-        print("Не удалось войти после подтверждения. Попробуй ещё раз позже.")
+            os.startfile(path)  # Windows: откроет картинку
+        except Exception:
+            pass
+        return input("Введи символы с картинки (с учётом регистра): ").strip()
+
+    def ask_email_code() -> str:
+        print("\nXiaomi просит подтвердить вход. Код отправлен на почту аккаунта.")
+        return input("\nКод из письма: ").strip()
+
+    cloud = XiaomiCloud()
+    try:
+        cloud.login(user, pw, ask_captcha, ask_email_code)
+    except AuthError as e:
+        print(f"\nВход не удался: {e}")
+        if isinstance(e, TwoFactorRequired):
+            print(f"Ссылка подтверждения: {e.url}")
         return 1
 
     print("\nВход выполнен. Ищу устройства по регионам…")
