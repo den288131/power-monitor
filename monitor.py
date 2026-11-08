@@ -422,8 +422,7 @@ def period_summary(hist: list[dict], start: float, end: float, now: float, title
 def day_summary(hist: list[dict], day, now: float, since: float | None = None) -> str:
     """Сутки, заканчивающиеся в SUMMARY_HOUR дня day."""
     end = _boundary(day)
-    hh = datetime.fromtimestamp(end, _tz()).strftime("%H:%M")
-    title = f"📊 Сводка за сутки: {WEEKDAYS[day.weekday()]} {day:%d.%m} (с {hh} вчера до {hh})"
+    title = f"📊 Сводка за сутки: {WEEKDAYS[day.weekday()]} {day:%d.%m}"
     return period_summary(hist, end - 86400, end, now, title, since)
 
 
@@ -455,18 +454,20 @@ def due_summaries(state: dict, now: float) -> list[tuple[str, str, str]]:
         return []
     hist, since = state.get("history", []), state.get("history_since")
     today = local.date()
+    no_data = bool(since and since >= _boundary(today))  # учёт начался уже после конца периода — слать нечего
     out = []
     if state.get("last_daily") != today.isoformat():
-        out.append(("last_daily", today.isoformat(), day_summary(hist, today, now, since)))
+        out.append(("last_daily", today.isoformat(), None if no_data else day_summary(hist, today, now, since)))
     if local.weekday() == int(env("SUMMARY_WEEKDAY", "6")) and state.get("last_weekly") != today.isoformat():
-        out.append(("last_weekly", today.isoformat(), week_summary(hist, today, now, since)))
+        out.append(("last_weekly", today.isoformat(), None if no_data else week_summary(hist, today, now, since)))
     return out
 
 
 def send_summaries(state: dict, now: float) -> None:
     for key, value, text in due_summaries(state, now):
         try:
-            tg_send(text)
+            if text:
+                tg_send(text)
             state[key] = value
         except Exception as e:
             print(f"Не удалось отправить сводку: {e}")
