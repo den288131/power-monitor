@@ -1,17 +1,19 @@
 name: Power monitor
 
+# Один запуск проверяет статус раз в минуту ~5 ч 45 мин. Cron каждые 15 мин держит следующий
+# запуск в очереди (concurrency), и он стартует сразу после окончания текущего — без пауз.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub может запускать с задержкой 5–15+ мин
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       test:
-        description: "Отправить тестовое сообщение в Telegram"
+        description: "Только тест: прислать текущий статус в Telegram (без цикла)"
         type: boolean
         default: true
 
 concurrency:
-  group: power-monitor
+  group: power-monitor-${{ inputs.test && 'test' || 'loop' }}
   cancel-in-progress: false
 
 permissions:
@@ -20,7 +22,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355   # лимит GitHub — 360
     steps:
       - uses: actions/checkout@v6
 
@@ -51,10 +53,11 @@ jobs:
           XIAOMI_DEVICE_ID: ${{ secrets.XIAOMI_DEVICE_ID }}
           OFFLINE_THRESHOLD_MIN: ${{ vars.OFFLINE_THRESHOLD_MIN }}
           TIMEZONE: ${{ vars.TIMEZONE }}
-        run: python monitor.py check ${{ inputs.test && '--test' || '' }}
+          PYTHONUNBUFFERED: "1"
+        run: python monitor.py check ${{ inputs.test && '--test' || '--loop-minutes 345 --interval 60' }}
 
       - name: Save state
-        if: always() && hashFiles('state.json') != ''
+        if: always() && !inputs.test && hashFiles('state.json') != ''
         uses: actions/cache/save@v5
         with:
           path: state.json

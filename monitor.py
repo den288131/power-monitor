@@ -4,7 +4,8 @@
 Команды:
   python monitor.py login         — ЛОКАЛЬНО: вход в Xiaomi, вывод токенов, региона и списка устройств
   python monitor.py check         — проверка статуса + уведомления (запускается в GitHub Actions)
-  python monitor.py check --test  — то же + тестовое сообщение в Telegram с текущим статусом
+  python monitor.py check --test  — только тестовое сообщение в Telegram с текущим статусом
+  python monitor.py check --loop-minutes 345 --interval 60 — проверять раз в минуту ~5,75 ч (режим Actions)
 """
 from __future__ import annotations
 
@@ -357,31 +358,39 @@ def save_state(state: dict) -> None:
 
 # ───────────────────────── Команды ─────────────────────────
 
+_cloud: XiaomiCloud | None = None  # переиспользуем сессию между проверками в цикле
+
+
 def fetch_device(state: dict, now: float) -> dict:
+    global _cloud
     region = env("XIAOMI_REGION", "de").lower()
     device_id = env("XIAOMI_DEVICE_ID")
     user, pw = env("XIAOMI_USERNAME"), env("XIAOMI_PASSWORD")
-    cloud = XiaomiCloud(env("XIAOMI_USER_ID"), env("XIAOMI_SSECURITY"), env("XIAOMI_SERVICE_TOKEN"))
+    if _cloud is None:
+        _cloud = XiaomiCloud(env("XIAOMI_USER_ID"), env("XIAOMI_SSECURITY"), env("XIAOMI_SERVICE_TOKEN"))
+    cloud = _cloud
 
     if cloud.has_session:
         try:
             return find_device(cloud.devices(region), device_id)
         except AuthError as e:
-            print(f"Токены не подошли: {e}")
+            print(f"Сессия не подошла: {e}")
             if not (user and pw):
                 raise
     if not (user and pw):
         raise AuthError("не заданы ни токены (XIAOMI_SERVICE_TOKEN и др.), ни логин/пароль")
 
     last = state.get("last_password_login", 0)
-    if (state.get("problem") or {}).get("kind") == "auth" and now - last < PASSWORD_RETRY_MIN * 60:
+    if now - last < PASSWORD_RETRY_MIN * 60:
         raise AuthError("вход по паролю недавно не удался, следующая попытка позже")
     state["last_password_login"] = now
+    _cloud = cloud = XiaomiCloud()
     try:
         cloud.login(user, pw)
     except TwoFactorRequired:
         raise AuthError("Xiaomi требует подтвердить вход с сервера GitHub. "
                         "Запусти локально `python monitor.py login` и обнови секреты с токенами") from None
+    state["last_password_login"] = 0
     print("Вход по паролю успешен (для стабильности лучше прописать свежие токены в секреты)")
     return find_device(cloud.devices(region), device_id)
 
@@ -401,30 +410,23 @@ def report_problem(state: dict, kind: str, text: str) -> None:
     state["problem"] = p
 
 
-def cmd_check(test: bool) -> int:
+def check_once(state: dict, threshold: float) -> dict:
+    """Одна проверка: обновляет state, шлёт уведомления. Возвращает устройство или {} при ошибке."""
     now = time.time()
-    threshold = float(env("OFFLINE_THRESHOLD_MIN", "10")) * 60
-    state = load_state()
-
     try:
         dev = fetch_device(state, now)
     except AuthError as e:
         print(f"Ошибка авторизации: {e}")
         report_problem(state, "auth", f"Ошибка входа в Xiaomi: {e}")
-        save_state(state)
-        if test:
-            tg_send(f"🔧 Тест: ошибка входа в Xiaomi — {e}")
-        return 1 if test else 0
+        return {}
     except Exception as e:
         print(f"Ошибка проверки: {type(e).__name__}: {e}")
         report_problem(state, "error", f"{type(e).__name__}: {e}")
-        save_state(state)
-        if test:
-            tg_send(f"🔧 Тест: ошибка проверки — {type(e).__name__}: {e}")
-        return 1 if test else 0
+        return {}
 
     online = bool(dev.get("isOnline"))
-    print(f"{dev.get('name')} [{dev.get('did')}, {dev.get('model')}]: {'online' if online else 'OFFLINE'}")
+    stamp = datetime.fromtimestamp(now, _tz()).strftime("%H:%M:%S")
+    print(f"{stamp} {dev.get('name')} [{dev.get('did')}]: {'online' if online else 'OFFLINE'}")
 
     if (state.get("problem") or {}).get("alerted"):
         try:
@@ -437,17 +439,37 @@ def cmd_check(test: bool) -> int:
     try:
         for ev in events:
             tg_send(event_text(ev, now))
-        state = new_state  # продвигаем состояние только если уведомления ушли
+        state.clear()
+        state.update(new_state)  # продвигаем состояние только если уведомления ушли
     except Exception as e:
-        print(f"Не удалось отправить уведомление, повторим в следующий запуск: {e}")
+        print(f"Не удалось отправить уведомление, повторим при следующей проверке: {e}")
     state["last_check"] = now
-    save_state(state)
+    return dev
 
-    if test:
-        cand = state.get("offline_candidate")
-        extra = f"\nОфлайн с {fmt_time(cand)}, ждём порог {int(threshold // 60)} мин." if cand and state.get("status") != "offline" else ""
-        tg_send(f"🔧 Тест мониторинга\n«{dev.get('name')}»: {'онлайн — свет есть' if online else 'офлайн'}{extra}")
-    return 0
+
+def cmd_check(test: bool, loop_minutes: float, interval: float) -> int:
+    threshold = float(env("OFFLINE_THRESHOLD_MIN", "5")) * 60
+    state = load_state()
+
+    if test:  # тест только сообщает статус и не трогает сохранённое состояние
+        try:
+            dev = fetch_device(state, time.time())
+        except Exception as e:
+            tg_send(f"🔧 Тест: ошибка проверки — {type(e).__name__}: {e}")
+            return 1
+        online = bool(dev.get("isOnline"))
+        tg_send(f"🔧 Тест мониторинга\n«{dev.get('name')}»: {'онлайн — свет есть' if online else 'офлайн'}\n"
+                f"Сохранённый статус: {state.get('status') or 'нет'}, порог {int(threshold // 60)} мин.")
+        return 0
+
+    deadline = time.time() + loop_minutes * 60
+    while True:
+        started = time.time()
+        check_once(state, threshold)
+        save_state(state)
+        if started + interval > deadline:
+            return 0
+        time.sleep(max(0.0, interval - (time.time() - started)))
 
 
 def cmd_login() -> int:
@@ -507,10 +529,12 @@ def main() -> int:
     sub.add_parser("login", help="локальный вход: токены, регион, список устройств")
     c = sub.add_parser("check", help="проверка статуса и уведомления")
     c.add_argument("--test", action="store_true", help="отправить тестовое сообщение с текущим статусом")
+    c.add_argument("--loop-minutes", type=float, default=0, help="проверять в цикле столько минут (0 — одна проверка)")
+    c.add_argument("--interval", type=float, default=60, help="пауза между проверками в цикле, сек")
     a = p.parse_args()
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8")
-    return cmd_login() if a.cmd == "login" else cmd_check(a.test)
+    return cmd_login() if a.cmd == "login" else cmd_check(a.test, a.loop_minutes, a.interval)
 
 
 if __name__ == "__main__":
