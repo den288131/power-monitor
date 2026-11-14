@@ -380,7 +380,7 @@ def save_state(state: dict) -> None:
 
 # ───────────────────────── История и сводки ─────────────────────────
 
-HISTORY_DAYS = 40
+HISTORY_DAYS = 400  # ~50 байт на отключение, хранить можно долго
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 
@@ -469,9 +469,10 @@ def day_summary(hist: list[dict], start: float, end: float, day, now: float, sin
     return period_summary(hist, start, end, now, title, since, ref=_boundary(day))
 
 
-def week_summary(hist: list[dict], start: float, end: float, last_day, now: float, since: float | None = None) -> str:
+def week_summary(hist: list[dict], start: float, end: float, last_day, now: float, since: float | None = None,
+                 title: str | None = None) -> str:
     first = last_day - timedelta(days=6)
-    title = f"📅 Сводка за неделю {first:%d.%m}–{last_day:%d.%m}"
+    title = title or f"📅 Сводка за неделю {first:%d.%m}–{last_day:%d.%m}"
     items = outages_in(hist, start, end, now)
     note = _since_note(since, start)
     if not items:
@@ -481,7 +482,9 @@ def week_summary(hist: list[dict], start: float, end: float, last_day, now: floa
     for i in range(7):
         d = first + timedelta(days=i)
         d_start = max(start, _boundary(d) - 86400)
-        d_end = end if i == 6 else _boundary(d)
+        if d_start >= end:  # будущие дни текущей недели не показываем
+            break
+        d_end = end if i == 6 else min(_boundary(d), end)
         di = outages_in(hist, d_start, d_end, now) if d_end > d_start else []
         dur = sum(b - a for a, b, _ in di)
         lines.append(f"{WEEKDAYS[d.weekday()]} {d:%d.%m}: " + (f"{fmt_dur(dur)} ({len(di)} шт.)" if di else "—"))
@@ -597,6 +600,53 @@ def update_pin(state: dict, now: float) -> None:
         print(f"Не удалось обновить закреп: {e}")
 
 
+def week_page(state: dict, offset: int, now: float) -> tuple[str, dict]:
+    """Неделя пн–вс (граница — SUMMARY_HOUR в SUMMARY_WEEKDAY). offset 0 — текущая, 1 — прошлая и т.д.
+    Возвращает текст и кнопки листания."""
+    wd = int(env("SUMMARY_WEEKDAY", "6"))
+    d = datetime.fromtimestamp(now, _tz()).date()
+    while d.weekday() != wd or _boundary(d) > now:  # последняя прошедшая граница недели
+        d -= timedelta(days=1)
+    last_day = d + timedelta(days=7 * (1 - offset))
+    end_b = _boundary(last_day)
+    start = end_b - 7 * 86400
+    end = min(end_b, now)
+    first = last_day - timedelta(days=6)
+    title = f"📅 Неделя {first:%d.%m}–{last_day:%d.%m}" + (" (идёт)" if offset == 0 else "")
+    hist, since = state.get("history", []), state.get("history_since")
+    text = week_summary(hist, start, end, last_day, now, since, title=title)
+
+    buttons = []
+    if not since or since < start:  # есть данные раньше — можно листать назад
+        p = last_day - timedelta(days=7)
+        buttons.append({"text": f"◀ {p - timedelta(days=6):%d.%m}–{p:%d.%m}", "callback_data": f"w:{offset + 1}"})
+    if offset > 0:
+        n = last_day + timedelta(days=7)
+        buttons.append({"text": f"{n - timedelta(days=6):%d.%m}–{n:%d.%m} ▶", "callback_data": f"w:{offset - 1}"})
+    return text, {"inline_keyboard": [buttons] if buttons else []}
+
+
+def handle_callback(state: dict, cq: dict) -> None:
+    msg = cq.get("message") or {}
+    if str((msg.get("chat") or {}).get("id")) != env("TELEGRAM_CHAT_ID"):
+        return
+    data = cq.get("data") or ""
+    try:
+        if data.startswith("w:"):
+            text, markup = week_page(state, max(0, int(data[2:])), time.time())
+            try:
+                tg_api("editMessageText", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
+                                           "text": text, "reply_markup": markup})
+            except TgError as e:
+                if "not modified" not in e.description:
+                    raise
+    finally:
+        try:
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]})  # убирает «часики» на кнопке
+        except Exception:
+            pass
+
+
 def handle_message(state: dict, msg: dict) -> None:
     if str((msg.get("chat") or {}).get("id")) != env("TELEGRAM_CHAT_ID"):
         return  # отвечаем только владельцу
@@ -607,9 +657,8 @@ def handle_message(state: dict, msg: dict) -> None:
     if cmd in (BTN_DAY, "/day"):
         tg_send(period_summary(hist, now - 86400, now, now, "📊 Сводка за последние 24 ч", since), reply_markup=KEYBOARD)
     elif cmd in (BTN_WEEK, "/week"):
-        today = datetime.fromtimestamp(now, _tz()).date()
-        start = _boundary(today - timedelta(days=6)) - 86400
-        tg_send(week_summary(hist, start, now, today, now, since), reply_markup=KEYBOARD)
+        text, markup = week_page(state, 0, now)
+        tg_send(text, reply_markup=markup)
     elif cmd in (BTN_STATUS, "/status"):
         tg_send(status_text(state, now), reply_markup=KEYBOARD)
     elif cmd == "/start":
@@ -632,7 +681,7 @@ def poll_commands(state: dict, until: float) -> None:
         wait = int(min(left, 50))
         try:
             updates = tg_api("getUpdates", {"offset": state.get("tg_offset", 0), "timeout": wait,
-                                            "allowed_updates": ["message"]}, timeout=wait + 15)
+                                            "allowed_updates": ["message", "callback_query"]}, timeout=wait + 15)
         except TgError as e:
             if e.code == 409 and "webhook" in e.description.lower():
                 print("У бота включён webhook от старой программы — отключаю, чтобы получать кнопки")
@@ -652,7 +701,10 @@ def poll_commands(state: dict, until: float) -> None:
         for u in updates or []:
             state["tg_offset"] = u["update_id"] + 1
             try:
-                handle_message(state, u.get("message") or {})
+                if "callback_query" in u:
+                    handle_callback(state, u["callback_query"])
+                else:
+                    handle_message(state, u.get("message") or {})
             except Exception as e:
                 print(f"Не удалось ответить на сообщение: {e}")
         if updates:
