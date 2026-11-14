@@ -280,20 +280,39 @@ def find_device(devices: list[dict], device_id: str) -> dict:
 
 # ───────────────────────── Telegram ─────────────────────────
 
-def tg_send(text: str) -> None:
-    token, chat = env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        print(f"[telegram не настроен] {text}")
-        return
+class TgError(RuntimeError):
+    def __init__(self, code: int, description: str):
+        super().__init__(f"Telegram: {code} {description}")
+        self.code, self.description = code, description
+
+
+def tg_api(method: str, payload: dict | None = None, timeout: float = HTTP_TIMEOUT):
+    token = env("TELEGRAM_BOT_TOKEN")
     try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
-                          timeout=HTTP_TIMEOUT)
+        r = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload or {}, timeout=timeout)
     except requests.RequestException as e:
         raise RuntimeError(f"Telegram недоступен: {type(e).__name__}") from None  # без URL — в нём токен
-    if not r.ok:
-        raise RuntimeError(f"Telegram: HTTP {r.status_code} {r.text[:200]}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise TgError(r.status_code, r.text[:200]) from None
+    if not data.get("ok"):
+        raise TgError(data.get("error_code", r.status_code), data.get("description", ""))
+    return data.get("result")
+
+
+def tg_configured() -> bool:
+    return bool(env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"))
+
+
+def tg_send(text: str, **extra) -> dict | None:
+    if not tg_configured():
+        print(f"[telegram не настроен] {text}")
+        return None
+    res = tg_api("sendMessage", {"chat_id": env("TELEGRAM_CHAT_ID"), "text": text,
+                                 "disable_web_page_preview": True, **extra})
     print(f"[telegram] {text}")
+    return res
 
 
 # ───────────────────────── Логика состояний ─────────────────────────
@@ -334,8 +353,11 @@ def fmt_time(ts: float) -> str:
 
 
 def fmt_dur(sec: float) -> str:
-    m = int(sec // 60)
+    m = int(max(sec, 0) // 60)
     h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d:
+        return f"{d} д {h} ч {m} мин"
     return f"{h} ч {m} мин" if h else f"{m} мин"
 
 
@@ -504,6 +526,139 @@ def send_summaries(state: dict, now: float) -> None:
             print(f"Не удалось отправить сводку: {e}")
 
 
+# ───────────────────────── Бот: кнопки и закреп ─────────────────────────
+
+BTN_DAY, BTN_WEEK, BTN_STATUS = "📊 Сутки", "📅 Неделя", "💡 Статус"
+KEYBOARD = {"keyboard": [[{"text": BTN_DAY}, {"text": BTN_WEEK}], [{"text": BTN_STATUS}]],
+            "resize_keyboard": True, "is_persistent": True}
+BOT_SETUP_VERSION = 1
+
+
+def setup_bot(state: dict) -> None:
+    """Один раз: меню команд и постоянные кнопки внизу чата."""
+    if not tg_configured() or state.get("bot_setup") == BOT_SETUP_VERSION:
+        return
+    try:
+        tg_api("setMyCommands", {"commands": [
+            {"command": "day", "description": "Сводка за последние сутки"},
+            {"command": "week", "description": "Сводка за последние 7 дней"},
+            {"command": "status", "description": "Есть ли сейчас свет"},
+        ]})
+        tg_send("🔘 Добавлены кнопки внизу чата: сводка за сутки, за неделю и текущий статус.\n"
+                "Сколько есть или нет света — в закреплённом сообщении вверху чата.", reply_markup=KEYBOARD)
+        state["bot_setup"] = BOT_SETUP_VERSION
+    except Exception as e:
+        print(f"Не удалось настроить кнопки бота: {e}")
+
+
+def status_text(state: dict, now: float) -> str:
+    status, since = state.get("status"), state.get("since")
+    if status not in ("online", "offline") or not since:
+        return "❔ Статус света пока неизвестен"
+    if status == "offline":
+        lines = [f"🔌 Света нет {fmt_dur(now - since)}", f"с {fmt_time(since)}"]
+    else:
+        lines = [f"💡 Свет есть {fmt_dur(now - since)}", f"с {fmt_time(since)}"]
+        cand = state.get("offline_candidate")
+        if cand:
+            lines.append(f"⏳ робот офлайн с {fmt_time(cand)}, ждём подтверждения")
+    if (state.get("problem") or {}).get("count"):
+        lines.append("⚠️ нет связи с Xiaomi — статус может быть устаревшим")
+    return "\n".join(lines)
+
+
+def update_pin(state: dict, now: float) -> None:
+    """Держит закреплённое сообщение со статусом света в актуальном виде."""
+    if not tg_configured() or "status" not in state:
+        return
+    chat = env("TELEGRAM_CHAT_ID")
+    text = f"{status_text(state, now)}\n🕐 обновлено {datetime.fromtimestamp(now, _tz()):%H:%M}"
+    if state.get("pin_text") == text:
+        return
+    mid = state.get("pin_id")
+    try:
+        if mid:
+            try:
+                tg_api("editMessageText", {"chat_id": chat, "message_id": mid, "text": text})
+            except TgError as e:
+                if "not modified" not in e.description:
+                    print(f"Закреп не обновился ({e.description}), создаю новый")
+                    try:
+                        tg_api("unpinChatMessage", {"chat_id": chat, "message_id": mid})
+                    except Exception:
+                        pass
+                    mid = None
+        if not mid:
+            mid = tg_api("sendMessage", {"chat_id": chat, "text": text, "disable_notification": True})["message_id"]
+            tg_api("pinChatMessage", {"chat_id": chat, "message_id": mid, "disable_notification": True})
+            state["pin_id"] = mid
+        state["pin_text"] = text
+    except Exception as e:
+        print(f"Не удалось обновить закреп: {e}")
+
+
+def handle_message(state: dict, msg: dict) -> None:
+    if str((msg.get("chat") or {}).get("id")) != env("TELEGRAM_CHAT_ID"):
+        return  # отвечаем только владельцу
+    text = (msg.get("text") or "").strip()
+    cmd = text.split("@")[0].lower() if text.startswith("/") else text
+    now = time.time()
+    hist, since = state.get("history", []), state.get("history_since")
+    if cmd in (BTN_DAY, "/day"):
+        tg_send(period_summary(hist, now - 86400, now, now, "📊 Сводка за последние 24 ч", since), reply_markup=KEYBOARD)
+    elif cmd in (BTN_WEEK, "/week"):
+        today = datetime.fromtimestamp(now, _tz()).date()
+        start = _boundary(today - timedelta(days=6)) - 86400
+        tg_send(week_summary(hist, start, now, today, now, since), reply_markup=KEYBOARD)
+    elif cmd in (BTN_STATUS, "/status"):
+        tg_send(status_text(state, now), reply_markup=KEYBOARD)
+    elif cmd == "/start":
+        tg_send("Я слежу за светом дома по роботу-пылесосу. Кнопки внизу: сводка за сутки, за неделю, "
+                "текущий статус.", reply_markup=KEYBOARD)
+    else:
+        tg_send("Не понял 🙂 Воспользуйся кнопками внизу.", reply_markup=KEYBOARD)
+
+
+def poll_commands(state: dict, until: float) -> None:
+    """Слушает сообщения боту (long polling) до момента until."""
+    if not tg_configured():
+        time.sleep(max(0.0, until - time.time()))
+        return
+    while True:
+        left = until - time.time()
+        if left <= 1:
+            time.sleep(max(0.0, left))
+            return
+        wait = int(min(left, 50))
+        try:
+            updates = tg_api("getUpdates", {"offset": state.get("tg_offset", 0), "timeout": wait,
+                                            "allowed_updates": ["message"]}, timeout=wait + 15)
+        except TgError as e:
+            if e.code == 409 and "webhook" in e.description.lower():
+                print("У бота включён webhook от старой программы — отключаю, чтобы получать кнопки")
+                try:
+                    tg_api("deleteWebhook")
+                except Exception as e2:
+                    print(f"Не удалось отключить webhook: {e2}")
+                    time.sleep(min(left, 10))
+                continue
+            print(f"getUpdates: {e}")
+            time.sleep(min(left, 10))
+            continue
+        except Exception as e:
+            print(f"getUpdates: {e}")
+            time.sleep(min(left, 10))
+            continue
+        for u in updates or []:
+            state["tg_offset"] = u["update_id"] + 1
+            try:
+                handle_message(state, u.get("message") or {})
+            except Exception as e:
+                print(f"Не удалось ответить на сообщение: {e}")
+        if updates:
+            save_state(state)
+
+
 # ───────────────────────── Команды ─────────────────────────
 
 _cloud: XiaomiCloud | None = None  # переиспользуем сессию между проверками в цикле
@@ -627,15 +782,18 @@ def cmd_check(test: bool, loop_minutes: float, interval: float) -> int:
         return 0
 
     deadline = time.time() + loop_minutes * 60
+    setup_bot(state)
     while True:
         started = time.time()
         check_once(state, threshold)
         send_summaries(state, time.time())
+        update_pin(state, time.time())
         save_state(state)
         heartbeat()
         if started + interval > deadline:
             return 0
-        time.sleep(max(0.0, interval - (time.time() - started)))
+        # вместо паузы слушаем кнопки бота — ответ приходит сразу
+        poll_commands(state, until=started + interval)
 
 
 def cmd_login() -> int:
